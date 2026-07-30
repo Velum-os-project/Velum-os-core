@@ -20,38 +20,47 @@
 set -e
 set -u
 
-# --------- Velum OS - Users and Groups Creator -----------
-create_users() {
-    echo "[users] Creting group and permissions..."
+# --- Velum OS - Users, Groups and ABAC Access Control ---
 
-    for dept in  "${DEPARTMENTS[@]}"; do
+create_users() {
+    echo "[users] Creating groups and ABAC permissions..."
+
+    for dept in "${DEPARTMENTS[@]}"; do
         for layer in "${LAYERS[@]}"; do
             local group="velum_${dept}_layer${layer}"
             local path="/velum/$dept/layer$layer"
 
-            # Create group if it doesn´t exist
+            # Create group if it doesn't exist
             if ! getent group "$group" > /dev/null 2>&1; then
                 groupadd "$group"
                 echo "[users] Created group: $group"
             else
-                echo "[users] Group already exixts: $group"
+                echo "[users] Group already exists: $group"
             fi
 
-            #Assign group ownership to folder
+            # Assign ownership
             chown "root:$group" "$path"
 
-            # Layer 1: read/write for group, nothing for others
-            # Layer 2: same but stricter
-            # Layer 3 and 4: group owner only, no others
-            if [ "$layer" -le 2 ]; then
-                chmod 770 "$path"
-            else
-                chmod 700 "$path"
+            # Remove all default permissions first
+            chmod 000 "$path"
+
+            # ABAC: grant access only if BOTH attributes match (dept + layer)
+            # Any other group gets explicit deny via ACL
+            setfacl -b "$path"
+            setfacl -m "g:$group:rwx" "$path"
+            setfacl -m "u:root:rwx" "$path"
+
+            # Layer 3 and 4: no execute for group, read/write only via GPG
+            if [ "$layer" -ge 3 ]; then
+                setfacl -m "g:$group:rw-" "$path"
             fi
 
-            echo "[users] Permissions set for: $path"
+            # Explicit deny for everyone else (ABAC: if attributes don't match, deny)
+            setfacl -m "o::---" "$path"
+
+            echo "[users] ABAC permissions set for: $path ($group)"
         done
     done
 
-    echo "[users] Groups and permissions complete."
+    echo "[users] ABAC setup complete."
 }

@@ -1,1 +1,1 @@
-# Velum-core
+# Velum OS core

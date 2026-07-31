@@ -45,5 +45,23 @@ net.ipv4.conf.all.accept_redirects=0
 net.ipv6.conf.all.accept_redirects=0
 EOF
 
+    # Restrict process visibility (users only see their own processes)
+    echo "proc /proc proc defaults,hidepid=2 0 0" >> /etc/fstab
+    mount -o remount,hidepid=2 /proc
+
+    # Restrict su to root only
+    echo "auth required pam_wheel.so use_uid" >> /etc/pam.d/su
+    groupadd -f wheel
+
+    # Disable sudo for non-authorized users
+    echo "Defaults !visiblepw" >> /etc/sudoers
+    echo "%wheel ALL=(ALL) ALL" >> /etc/sudoers
+
+    # Prevent privilege escalation via suid binaries
+    find / -perm -4000 -type f 2>/dev/null | while read binary; do
+        chmod u-s "$binary"
+        echo "[kernel] Removed SUID from: $binary"
+    done
+
     echo "[kernel] Hardening rules applied."
 }

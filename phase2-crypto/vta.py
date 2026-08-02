@@ -16,12 +16,17 @@
 # along with this program. If not, see <https://gnu.org>.
 # ==============================================================================
 
-# --- Velum OS - Velum Trust Authority (VTA) ---
+# cython: language_level=3
+# --- Velum OS - Velum Trust Authority (libssl/libcrypto) ---
 
-import subprocess
-import os
+import ctypes
+import ctypes.util
 import sys
-from datetime import datetime
+import os
+
+# Load libssl and libcrypto directly
+_ssl    = ctypes.CDLL(ctypes.util.find_library("ssl"))
+_crypto = ctypes.CDLL(ctypes.util.find_library("crypto"))
 
 VTA_ROOT     = "/velum/layer4/vta"
 VTA_ROOT_KEY = f"{VTA_ROOT}/root/vta-root.key"
@@ -29,51 +34,128 @@ VTA_ROOT_CRT = f"{VTA_ROOT}/root/vta-root.crt"
 VTA_INT_DIR  = f"{VTA_ROOT}/intermediate"
 VTA_CRL_DIR  = f"{VTA_ROOT}/crl"
 
-
-def run(cmd: list, check=True) -> subprocess.CompletedProcess:
-    """Run a shell command safely."""
-    return subprocess.run(cmd, check=check, capture_output=True, text=True)
+# RSA key size
+RSA_BITS = 4096
 
 
 def init_directories() -> None:
-    """Create VTA directory structure in Layer 4."""
     for path in [VTA_ROOT, f"{VTA_ROOT}/root", VTA_INT_DIR, VTA_CRL_DIR]:
         os.makedirs(path, exist_ok=True)
     print("[vta] Directory structure initialized.")
 
 
+def _generate_rsa_key(path: str) -> None:
+    """Generate RSA 4096 key using libcrypto and write to PEM file."""
+    ctx = _crypto.EVP_PKEY_CTX_new_id(6, None)  # 6 = EVP_PKEY_RSA
+    _crypto.EVP_PKEY_keygen_init(ctx)
+    _crypto.EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, RSA_BITS)
+
+    pkey = ctypes.c_void_p()
+    _crypto.EVP_PKEY_keygen(ctx, ctypes.byref(pkey))
+    _crypto.EVP_PKEY_CTX_free(ctx)
+
+    bio = _crypto.BIO_new_file(path.encode(), b"w")
+    _crypto.PEM_write_bio_PrivateKey(bio, pkey, None, None, 0, None, None)
+    _crypto.BIO_free(bio)
+    _crypto.EVP_PKEY_free(pkey)
+    print(f"[vta] Key written to {path}")
+
+
+def _read_pem_key(path: str) -> ctypes.c_void_p:
+    bio = _crypto.BIO_new_file(path.encode(), b"r")
+    pkey = _crypto.PEM_read_bio_PrivateKey(bio, None, None, None)
+    _crypto.BIO_free(bio)
+    return pkey
+
+
+def _read_pem_cert(path: str) -> ctypes.c_void_p:
+    bio = _crypto.BIO_new_file(path.encode(), b"r")
+    cert = _crypto.PEM_read_bio_X509(bio, None, None, None)
+    _crypto.BIO_free(bio)
+    return cert
+
+
+def _write_pem_cert(cert: ctypes.c_void_p, path: str) -> None:
+    bio = _crypto.BIO_new_file(path.encode(), b"w")
+    _crypto.PEM_write_bio_X509(bio, cert)
+    _crypto.BIO_free(bio)
+
+
+def _create_cert(subject_cn: str, subject_ou: str, pkey, issuer_cert, issuer_key, days: int, extensions: dict = None) -> ctypes.c_void_p:
+    """Create and sign an X509 certificate."""
+    cert = _crypto.X509_new()
+
+    # Set version to X509v3
+    _crypto.X509_set_version(cert, 2)
+
+    # Set serial number
+    serial = _crypto.ASN1_INTEGER_new()
+    _crypto.ASN1_INTEGER_set(serial, os.getpid())
+    _crypto.X509_set_serialNumber(cert, serial)
+
+    # Set validity
+    _crypto.X509_gmtime_adj(_crypto.X509_get_notBefore(cert), 0)
+    _crypto.X509_gmtime_adj(_crypto.X509_get_notAfter(cert), days * 86400)
+
+    # Set subject
+    name = _crypto.X509_get_subject_name(cert)
+    _crypto.X509_NAME_add_entry_by_txt(name, b"CN", 0x1000, subject_cn.encode(), -1, -1, 0)
+    _crypto.X509_NAME_add_entry_by_txt(name, b"O",  0x1000, b"Velum OS", -1, -1, 0)
+    _crypto.X509_NAME_add_entry_by_txt(name, b"OU", 0x1000, subject_ou.encode(), -1, -1, 0)
+
+    # Set issuer
+    if issuer_cert:
+        issuer_name = _crypto.X509_get_subject_name(issuer_cert)
+        _crypto.X509_set_issuer_name(cert, issuer_name)
+    else:
+        _crypto.X509_set_issuer_name(cert, name)
+
+    # Set public key
+    _crypto.X509_set_pubkey(cert, pkey)
+
+    # Add Velum OS custom extensions if provided
+    if extensions:
+        for oid, value in extensions.items():
+            ex = _crypto.X509V3_EXT_conf_nid(None, None, oid.encode(), value.encode())
+            if ex:
+                _crypto.X509_add_ext(cert, ex, -1)
+                _crypto.X509_EXTENSION_free(ex)
+
+    # Sign with issuer key (or self if root)
+    sign_key = issuer_key if issuer_key else pkey
+    _crypto.X509_sign(cert, sign_key, _crypto.EVP_sha512())
+
+    return cert
+
+
 def generate_root_ca() -> None:
-    """Generate the VTA root CA. Stored in Layer 4."""
     if os.path.exists(VTA_ROOT_CRT):
         print("[vta] Root CA already exists. Skipping.")
         return
 
     print("[vta] Generating root CA key...")
-    run([
-        "openssl", "genrsa",
-        "-aes256",
-        "-out", VTA_ROOT_KEY,
-        "4096"
-    ])
+    _generate_rsa_key(VTA_ROOT_KEY)
 
     print("[vta] Generating root CA certificate (valid 20 years)...")
-    run([
-        "openssl", "req", "-x509", "-new",
-        "-key", VTA_ROOT_KEY,
-        "-sha512",
-        "-days", "7300",
-        "-out", VTA_ROOT_CRT,
-        "-subj", "/CN=Velum Trust Authority/O=Velum OS/OU=Root CA"
-    ])
+    pkey = _read_pem_key(VTA_ROOT_KEY)
+    cert = _create_cert(
+        subject_cn="Velum Trust Authority",
+        subject_ou="Root CA",
+        pkey=pkey,
+        issuer_cert=None,
+        issuer_key=None,
+        days=7300
+    )
+    _write_pem_cert(cert, VTA_ROOT_CRT)
+    _crypto.X509_free(cert)
+    _crypto.EVP_PKEY_free(pkey)
     print("[vta] Root CA generated and stored in Layer 4.")
 
 
 def generate_intermediate_ca(department: str) -> None:
-    """Generate an intermediate CA for a department."""
-    int_dir  = f"{VTA_INT_DIR}/{department}"
-    int_key  = f"{int_dir}/vta-{department}.key"
-    int_csr  = f"{int_dir}/vta-{department}.csr"
-    int_crt  = f"{int_dir}/vta-{department}.crt"
+    int_dir = f"{VTA_INT_DIR}/{department}"
+    int_key = f"{int_dir}/vta-{department}.key"
+    int_crt = f"{int_dir}/vta-{department}.crt"
 
     os.makedirs(int_dir, exist_ok=True)
 
@@ -82,98 +164,97 @@ def generate_intermediate_ca(department: str) -> None:
         return
 
     print(f"[vta] Generating intermediate CA for {department}...")
-    run(["openssl", "genrsa", "-aes256", "-out", int_key, "4096"])
+    _generate_rsa_key(int_key)
 
-    run([
-        "openssl", "req", "-new",
-        "-key", int_key,
-        "-out", int_csr,
-        "-subj", f"/CN=VTA-{department.upper()}/O=Velum OS/OU={department}"
-    ])
+    pkey        = _read_pem_key(int_key)
+    root_cert   = _read_pem_cert(VTA_ROOT_CRT)
+    root_key    = _read_pem_key(VTA_ROOT_KEY)
 
-    run([
-        "openssl", "x509", "-req",
-        "-in", int_csr,
-        "-CA", VTA_ROOT_CRT,
-        "-CAkey", VTA_ROOT_KEY,
-        "-CAcreateserial",
-        "-out", int_crt,
-        "-days", "1825",
-        "-sha512"
-    ])
+    cert = _create_cert(
+        subject_cn=f"VTA-{department.upper()}",
+        subject_ou=department,
+        pkey=pkey,
+        issuer_cert=root_cert,
+        issuer_key=root_key,
+        days=1825
+    )
+    _write_pem_cert(cert, int_crt)
+    _crypto.X509_free(cert)
+    _crypto.X509_free(root_cert)
+    _crypto.EVP_PKEY_free(pkey)
+    _crypto.EVP_PKEY_free(root_key)
     print(f"[vta] Intermediate CA for {department} generated.")
 
 
 def issue_certificate(department: str, layer: str, machine_name: str) -> None:
-    """Issue a certificate for a machine with Velum OS custom attributes."""
-    int_dir  = f"{VTA_INT_DIR}/{department}"
-    int_key  = f"{int_dir}/vta-{department}.key"
-    int_crt  = f"{int_dir}/vta-{department}.crt"
-    cert_dir = f"{int_dir}/certs"
+    int_dir     = f"{VTA_INT_DIR}/{department}"
+    int_key     = f"{int_dir}/vta-{department}.key"
+    int_crt     = f"{int_dir}/vta-{department}.crt"
+    cert_dir    = f"{int_dir}/certs"
     machine_key = f"{cert_dir}/{machine_name}.key"
-    machine_csr = f"{cert_dir}/{machine_name}.csr"
     machine_crt = f"{cert_dir}/{machine_name}.crt"
-    ext_file    = f"{cert_dir}/{machine_name}.ext"
 
     os.makedirs(cert_dir, exist_ok=True)
 
     print(f"[vta] Issuing certificate for {machine_name} ({department} / {layer})...")
+    _generate_rsa_key(machine_key)
 
-    run(["openssl", "genrsa", "-out", machine_key, "4096"])
-    run([
-        "openssl", "req", "-new",
-        "-key", machine_key,
-        "-out", machine_csr,
-        "-subj", f"/CN={machine_name}/O=Velum OS/OU={department}"
-    ])
+    pkey     = _read_pem_key(machine_key)
+    int_cert = _read_pem_cert(int_crt)
+    int_pkey = _read_pem_key(int_key)
 
-    # Velum OS custom X.509 extensions
-    with open(ext_file, "w") as f:
-        f.write(f"""[velum_ext]
-subjectAltName=DNS:{machine_name}
-1.3.6.1.4.1.99999.1=ASN1:UTF8String:{department}
-1.3.6.1.4.1.99999.2=ASN1:UTF8String:{layer}
-""")
+    # Velum OS custom X.509 attributes
+    extensions = {
+        "subjectAltName": f"DNS:{machine_name}",
+    }
 
-    run([
-        "openssl", "x509", "-req",
-        "-in", machine_csr,
-        "-CA", int_crt,
-        "-CAkey", int_key,
-        "-CAcreateserial",
-        "-out", machine_crt,
-        "-days", "365",
-        "-sha512",
-        "-extfile", ext_file,
-        "-extensions", "velum_ext"
-    ])
+    cert = _create_cert(
+        subject_cn=machine_name,
+        subject_ou=department,
+        pkey=pkey,
+        issuer_cert=int_cert,
+        issuer_key=int_pkey,
+        days=365,
+        extensions=extensions
+    )
+    _write_pem_cert(cert, machine_crt)
+    _crypto.X509_free(cert)
+    _crypto.X509_free(int_cert)
+    _crypto.EVP_PKEY_free(pkey)
+    _crypto.EVP_PKEY_free(int_pkey)
     print(f"[vta] Certificate issued: {machine_crt}")
 
 
 def revoke_certificate(department: str, machine_name: str) -> None:
-    """Revoke a certificate and update the CRL."""
     int_dir     = f"{VTA_INT_DIR}/{department}"
     int_key     = f"{int_dir}/vta-{department}.key"
     int_crt     = f"{int_dir}/vta-{department}.crt"
     machine_crt = f"{int_dir}/certs/{machine_name}.crt"
-    crl_file    = f"{VTA_CRL_DIR}/{department}.crl"
+    crl_path    = f"{VTA_CRL_DIR}/{department}.crl"
 
     print(f"[vta] Revoking certificate for {machine_name}...")
-    run([
-        "openssl", "ca",
-        "-revoke", machine_crt,
-        "-keyfile", int_key,
-        "-cert", int_crt
-    ])
 
-    run([
-        "openssl", "ca",
-        "-gencrl",
-        "-keyfile", int_key,
-        "-cert", int_crt,
-        "-out", crl_file
-    ])
-    print(f"[vta] Certificate revoked. CRL updated: {crl_file}")
+    crl  = _crypto.X509_CRL_new()
+    cert = _read_pem_cert(machine_crt)
+    pkey = _read_pem_key(int_key)
+    ca   = _read_pem_cert(int_crt)
+
+    serial   = _crypto.X509_get_serialNumber(cert)
+    revoked  = _crypto.X509_REVOKED_new()
+    _crypto.X509_REVOKED_set_serialNumber(revoked, serial)
+    _crypto.X509_CRL_add0_revoked(crl, revoked)
+    _crypto.X509_CRL_set_issuer_name(crl, _crypto.X509_get_subject_name(ca))
+    _crypto.X509_CRL_sign(crl, pkey, _crypto.EVP_sha512())
+
+    bio = _crypto.BIO_new_file(crl_path.encode(), b"w")
+    _crypto.PEM_write_bio_X509_CRL(bio, crl)
+    _crypto.BIO_free(bio)
+
+    _crypto.X509_CRL_free(crl)
+    _crypto.X509_free(cert)
+    _crypto.X509_free(ca)
+    _crypto.EVP_PKEY_free(pkey)
+    print(f"[vta] Certificate revoked. CRL updated: {crl_path}")
 
 
 if __name__ == "__main__":

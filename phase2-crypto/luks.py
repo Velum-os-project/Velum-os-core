@@ -16,70 +16,113 @@
 # along with this program. If not, see <https://gnu.org>.
 # ==============================================================================
 
-# --- Velum OS - LUKS Automated Disk Encryption ---
+# cython: language_level=3
+# --- Velum OS - LUKS Automated Disk Encryption (libcryptsetup) ---
 
-import subprocess
+import ctypes
+import ctypes.util
 import sys
 import os
 
+# Load libcryptsetup directly
+_lib = ctypes.CDLL(ctypes.util.find_library("cryptsetup"))
+
 VELUM_LAYERS = {
-    "layer3": "/dev/sdb",  # Device for Layer 3 (adjust per deployment)
-    "layer4": "/dev/sdc",  # Device for Layer 4 (adjust per deployment)
+    "layer3": "/dev/sdb",
+    "layer4": "/dev/sdc",
 }
 
 MAPPER_PREFIX = "velum"
 
 
-def run(cmd: list, check=True) -> subprocess.CompletedProcess:
-    """Run a shell command safely."""
-    return subprocess.run(cmd, check=check, capture_output=True, text=True)
+def _get_device_handle(device: str):
+    cd = ctypes.c_void_p()
+    ret = _lib.crypt_init(ctypes.byref(cd), device.encode())
+    if ret < 0:
+        print(f"[luks] Failed to init device: {device}")
+        sys.exit(1)
+    return cd
 
 
 def is_luks(device: str) -> bool:
-    """Check if a device is already LUKS formatted."""
-    result = run(["cryptsetup", "isLuks", device], check=False)
-    return result.returncode == 0
+    cd = _get_device_handle(device)
+    ret = _lib.crypt_load(cd, b"LUKS2", None)
+    _lib.crypt_free(cd)
+    return ret == 0
 
 
 def setup_luks(device: str, layer: str, keyfile: str) -> None:
-    """Format and open a LUKS device for a given layer."""
     mapper = f"{MAPPER_PREFIX}_{layer}"
 
-    if is_luks(device):
-        print(f"[luks] {device} is already LUKS formatted.")
-    else:
-        print(f"[luks] Formatting {device} as LUKS for {layer}...")
-        run([
-            "cryptsetup", "luksFormat",
-            "--type", "luks2",
-            "--key-file", keyfile,
-            "--batch-mode",
-            device
-        ])
+    if not is_luks(device):
+        print(f"[luks] Formatting {device} as LUKS2 for {layer}...")
+        cd = _get_device_handle(device)
+        params = None  # use defaults
+        ret = _lib.crypt_format(
+            cd,
+            b"LUKS2",
+            b"aes",
+            b"xts-plain64",
+            None,
+            None,
+            64,
+            params
+        )
+        if ret < 0:
+            print(f"[luks] Format failed: {ret}")
+            sys.exit(1)
+
+        ret = _lib.crypt_keyslot_add_by_keyfile(
+            cd, -1,
+            None, 0,
+            keyfile.encode(), os.path.getsize(keyfile)
+        )
+        if ret < 0:
+            print(f"[luks] Failed to add keyfile: {ret}")
+            sys.exit(1)
+
+        _lib.crypt_free(cd)
         print(f"[luks] {device} formatted successfully.")
 
     print(f"[luks] Opening {device} as /dev/mapper/{mapper}...")
-    run([
-        "cryptsetup", "open",
-        "--key-file", keyfile,
-        device, mapper
-    ])
-    print(f"[luks] {layer} is now available at /dev/mapper/{mapper}")
+    cd = _get_device_handle(device)
+    _lib.crypt_load(cd, b"LUKS2", None)
+    ret = _lib.crypt_activate_by_keyfile(
+        cd,
+        mapper.encode(),
+        -1,
+        keyfile.encode(),
+        os.path.getsize(keyfile),
+        0
+    )
+    if ret < 0:
+        print(f"[luks] Failed to open device: {ret}")
+        sys.exit(1)
+    _lib.crypt_free(cd)
+    print(f"[luks] {layer} available at /dev/mapper/{mapper}")
 
 
 def close_luks(layer: str) -> None:
-    """Close a LUKS device."""
     mapper = f"{MAPPER_PREFIX}_{layer}"
-    print(f"[luks] Closing /dev/mapper/{mapper}...")
-    run(["cryptsetup", "close", mapper])
+    cd = ctypes.c_void_p()
+    _lib.crypt_init_by_name(ctypes.byref(cd), mapper.encode())
+    ret = _lib.crypt_deactivate(cd, mapper.encode())
+    _lib.crypt_free(cd)
+    if ret < 0:
+        print(f"[luks] Failed to close {mapper}")
+        sys.exit(1)
     print(f"[luks] {layer} closed.")
 
 
 def status_luks(layer: str) -> None:
-    """Show status of a LUKS device."""
     mapper = f"{MAPPER_PREFIX}_{layer}"
-    result = run(["cryptsetup", "status", mapper], check=False)
-    print(result.stdout if result.stdout else f"[luks] {layer} is not active.")
+    cd = ctypes.c_void_p()
+    ret = _lib.crypt_init_by_name(ctypes.byref(cd), mapper.encode())
+    if ret < 0:
+        print(f"[luks] {layer} is not active.")
+    else:
+        print(f"[luks] {layer} is active at /dev/mapper/{mapper}")
+    _lib.crypt_free(cd)
 
 
 if __name__ == "__main__":
